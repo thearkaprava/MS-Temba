@@ -1,17 +1,19 @@
-<div align="center">
-    <h1>MS-Temba: Multi-Scale Temporal Mamba for Efficient Temporal Action Detection</h1>
-    <a href="https://arxiv.org/abs/2501.06138" target="_blank">
-        <img src="https://img.shields.io/badge/arXiv-2501.06138-B31B1B?style=flat-square" alt="arXiv">
-    </a>
+<div align="center" style="display:flex;flex-direction:column;align-items:center;gap:8px;">
+    <img src="assets/logo.png" alt="MS-Temba logo" style="width:128px;height:128px;object-fit:contain;margin:0;"/>
+    <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:center;">
+        <h1 style="margin:0;text-align:center;">MS-Temba: Multi-Scale Temporal Mamba for Understanding Long Untrimmed Videos</h1>
+        <a href="https://arxiv.org/abs/2501.06138" target="_blank">
+            <img src="https://img.shields.io/badge/arXiv-2501.06138-B31B1B?style=flat-square" alt="arXiv">
+        </a>
+    </div>
 </div>
 
 <div align="center">
-<img src="assets/Teaser.png" />
+<img src="assets/ms_temba_teaser.png" />
 </div>
 
 ## Abstract
-Temporal Action Detection (TAD) in untrimmed videos requires models that can efficiently (1) process long-duration videos, (2) capture temporal variations within action classes, and (3) handle dense, overlapping actions, all while remaining suitable for resource-constrained edge deployment. While Transformer-based methods achieve high accuracy, their quadratic complexity hinders deployment in such scenarios. Given the recent popularity of linear complexity Mamba-based models, leveraging them for TAD is a natural choice. However, naively adapting Mamba from language or vision tasks fails to provide an optimal solution and does not address the challenges of long, untrimmed videos. Therefore, we propose <b>Multi-Scale Temporal Mamba (MS-Temba)</b>, the first Mamba-based architecture specifically designed for densely labeled TAD tasks. MS-Temba features Temporal Mamba Blocks (Temba Blocks), consisting of Temporal Convolutional
-Module (TCM) and Dilated SSM (D-SSM). TCM captures short-term dependencies using dilated convolutions, while D-SSM introduces a novel dilated state-space mechanism tomodel long-range temporal relationships effectively at each temporal scale. These multi-scale representations are aggregated by Scale-Aware State Fuser, which learns a unified representation for detecting densely overlapping actions. Experiments show that MS-Temba achieves state-of-the-art performance on long-duration videos, remains competitive on shorter segments, and reduces model complexity by 88%. Its efficiency and effectiveness make MS-Temba well-suited for real-world edge deployment.
+Temporal Action Detection (TAD) in untrimmed videos poses significant challenges, particularly for Activities of Daily Living (ADL) requiring models to (1) process long-duration videos, (2) capture temporal variations in actions, and (3) simultaneously detect dense overlapping actions. Existing CNN and Transformer-based approaches, struggle to jointly capture fine-grained detail and long-range structure at scale. State-space Model (SSM) based Mamba offers powerful long-range modeling, but naive application to TAD collapses fine-grained temporal structure and fails to account for the challenges inherent to TAD. To this end, we propose Multi-Scale Temporal Mamba (MS-Temba), which extends Mamba to TAD with newly introduced dilated SSMs. Each Temba block, comprising dilated SSMs coupled with our proposed additional losses, enables the learning of discriminative representations across temporal scales. A lightweight Multi-scale Mamba Fuser then unifies these multi-scale features via SSM-based aggregation, yielding precise action-boundary localization. With only 17M parameters, MS-Temba achieves state-of-the-art performance on densely labeled ADL benchmarks TSU & Charades, and further generalizes to long-form video summarization, setting new state-of-the-art results on TVSum & SumMe.
 
 ## Prepare the environment
 

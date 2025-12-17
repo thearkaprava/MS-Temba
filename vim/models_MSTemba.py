@@ -18,7 +18,7 @@ import math
 
 from collections import namedtuple
 
-from mamba_ssm.modules.mamba_simple import Mamba
+from mamba_ssm.modules.mamba_simple_getC import Mamba
 from mamba_ssm.utils.generation import GenerationMixin
 from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 
@@ -30,6 +30,54 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
+def compute_c_state_diversity_loss_simple(c_states_list):
+    """
+    Compute diversity loss between C states using cosine similarity.
+    This version is more compatible with Mamba's backward pass.
+    
+    Args:
+        c_states_list: List of C states from different dilation groups
+    
+    Returns:
+        diversity_loss: Cosine similarity diversity loss between C states
+    """
+    if len(c_states_list) < 2:
+        return torch.tensor(0.0, device=c_states_list[0].device)
+    
+    total_loss = 0.0
+    num_pairs = 0
+    
+    # Compute pairwise diversity losses
+    for i in range(len(c_states_list)):
+        for j in range(i + 1, len(c_states_list)):
+            c_i = c_states_list[i]
+            c_j = c_states_list[j]
+            
+            # Ensure both C states have the same shape for comparison
+            if c_i.shape != c_j.shape:
+                # Take the minimum length and truncate
+                min_len = min(c_i.shape[-1], c_j.shape[-1])
+                c_i = c_i[..., :min_len]
+                c_j = c_j[..., :min_len]
+            
+            # Flatten C states to compute cosine similarity
+            c_i_flat = c_i.reshape(c_i.shape[0], -1)  # (B, d_state * seq_len)
+            c_j_flat = c_j.reshape(c_j.shape[0], -1)  # (B, d_state * seq_len)
+            
+            # Normalize for cosine similarity
+            c_i_norm = F.normalize(c_i_flat, p=2, dim=1)
+            c_j_norm = F.normalize(c_j_flat, p=2, dim=1)
+            
+            # Compute cosine similarity (1 - cosine_similarity for diversity)
+            cosine_sim = torch.sum(c_i_norm * c_j_norm, dim=1)
+            # diversity_loss = cosine_sim.mean()  # Penalize high similarity (closer to 1)
+            diversity_loss = 1 - cosine_sim.mean()  # Penalize low similarity (closer to 1)
+            
+            total_loss += diversity_loss
+            num_pairs += 1
+    
+    return total_loss / num_pairs if num_pairs > 0 else torch.tensor(0.0, device=c_states_list[0].device)
+    
 
 __all__ = [
     'vim_tiny_patch16_224', 'vim_small_patch16_224', 'vim_base_patch16_224',
@@ -133,8 +181,8 @@ class Block(nn.Module):
                     residual_in_fp32=self.residual_in_fp32,
                     eps=self.norm.eps,
                 )    
-        hidden_states = self.mixer(hidden_states, inference_params=inference_params)
-        return hidden_states, residual
+        hidden_states, C = self.mixer(hidden_states, inference_params=inference_params)
+        return hidden_states, residual, C
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         return self.mixer.allocate_inference_cache(batch_size, max_seqlen, dtype=dtype, **kwargs)
@@ -468,6 +516,7 @@ class VisionMamba(nn.Module):
         # mamba impl
         residual = None
         hidden_states = x
+        C = None  # Initialize C state
         if not self.if_bidirectional:
             for layer in self.layers:
 
@@ -486,7 +535,7 @@ class VisionMamba(nn.Module):
                     hidden_states = hidden_states.flip([1])
                     if residual is not None:
                         residual = residual.flip([1])
-                hidden_states, residual = layer(
+                hidden_states, residual, C = layer(
                     hidden_states, residual, inference_params=inference_params
                 )
         else:
@@ -497,10 +546,10 @@ class VisionMamba(nn.Module):
                     if residual is not None and self.if_rope_residual:
                         residual = self.rope(residual)
 
-                hidden_states_f, residual_f = self.layers[i * 2](
+                hidden_states_f, residual_f, C_f = self.layers[i * 2](
                     hidden_states, residual, inference_params=inference_params
                 )
-                hidden_states_b, residual_b = self.layers[i * 2 + 1](
+                hidden_states_b, residual_b, C_b = self.layers[i * 2 + 1](
                     hidden_states.flip([1]), None if residual == None else residual.flip([1]), inference_params=inference_params
                 )
                 hidden_states = hidden_states_f + hidden_states_b.flip([1])
@@ -528,23 +577,23 @@ class VisionMamba(nn.Module):
         # return only cls token if it exists
         if self.if_cls_token:
             if self.use_double_cls_token:
-                return (hidden_states[:, token_position[0], :] + hidden_states[:, token_position[1], :]) / 2
+                return (hidden_states[:, token_position[0], :] + hidden_states[:, token_position[1], :]) / 2, C
             else:
                 if self.use_middle_cls_token:
-                    return hidden_states[:, token_position, :]
+                    return hidden_states[:, token_position, :], C
                 elif if_random_cls_token_position:
-                    return hidden_states[:, token_position, :]
+                    return hidden_states[:, token_position, :], C
                 else:
-                    return hidden_states[:, token_position, :]
+                    return hidden_states[:, token_position, :], C
 
         if self.final_pool_type == 'none':
-            return hidden_states[:, -1, :]
+            return hidden_states[:, -1, :], C
         elif self.final_pool_type == 'mean':
-            return hidden_states.mean(dim=1)
+            return hidden_states.mean(dim=1), C
         elif self.final_pool_type == 'max':
-            return hidden_states
+            return hidden_states, C
         elif self.final_pool_type == 'all':
-            return hidden_states
+            return hidden_states, C
         else:
             raise NotImplementedError
 
@@ -558,18 +607,16 @@ class VisionMamba(nn.Module):
             x = x.max(dim=1)[0]
         return x
 
-class TemporalConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride, dilation=1):
+class LinearProjection(nn.Module):
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride=stride, padding=dilation*(kernel_size//2), dilation=dilation)
+        self.linear = nn.Linear(in_channels, out_channels)
         self.norm = nn.LayerNorm(out_channels)
         self.activation = nn.GELU()
 
     def forward(self, x):
         # x shape: (B, T, C)
-        x = x.transpose(1, 2)  # (B, C, T)
-        x = self.conv(x)
-        x = x.transpose(1, 2)  # (B, T, C)
+        x = self.linear(x)
         x = self.norm(x)
         x = self.activation(x)
         return x
@@ -586,24 +633,22 @@ def resize(input,
 
 class MSTemba(nn.Module):
     def __init__(self, 
-                 in_feat_dim=768, #CLIP
-                #  in_feat_dim=1024, #I3D
-                #  in_chans=3, 
+                 in_feat_dim=768, #CLIP; 1024 for I3D
                  num_classes=157,
-                 embed_dims=[256, 384, 576, 864],
-                 temporal_dims=[256, 128, 64, 32],
-                 depths=[1, 1, 1, 1],
+                 embed_dims=[256, 384, 576],
+                 depths=[1, 1, 1],
                  d_state=16,
                  **kwargs):
         super().__init__()
+        # Add linear layers for each block
+        self.block_heads = nn.ModuleList([
+            nn.Linear(embed_dims[i], num_classes) for i in range(3)
+        ])
         
         self.num_classes = num_classes
         self.depths = depths
         self.embed_dims = embed_dims
-        self.temporal_dims = temporal_dims
-        tsu_temporal_dim = 2500
-        ch_temporal_dim = 256
-        mth_temporal_dim = 2000
+
         self.proj = nn.Linear(in_feat_dim, embed_dims[0])
 
         self.scale_proj1 = nn.Linear(embed_dims[0], embed_dims[2])
@@ -612,18 +657,28 @@ class MSTemba(nn.Module):
 
         # Hierarchical blocks
         self.blocks = nn.ModuleList()
-        for i in range(len(depths)):
-            # Temporal convolution
-            if i == 0:
-                self.blocks.append(TemporalConvBlock(embed_dims[0], embed_dims[i], kernel_size=3, stride=1, dilation=i+1))
-            else:
-                self.blocks.append(TemporalConvBlock(embed_dims[i-1], embed_dims[i], kernel_size=3, stride=1, dilation=i+1))
-            
-            # Vision Mamba block
-            self.blocks.append(self._create_mamba_block(embed_dims[i], d_state, depths[i], **kwargs))
+        
+        # First block - single SSM
+        self.blocks.append(LinearProjection(embed_dims[0], embed_dims[0]))
+        self.blocks.append(self._create_mamba_block(embed_dims[0], d_state, depths[0], **kwargs))
+        
+        # Second block - two SSMs for odd/even tokens
+        self.blocks.append(LinearProjection(embed_dims[0], embed_dims[1]))
+        self.blocks.append(nn.ModuleList([
+            self._create_mamba_block(embed_dims[1], d_state, depths[1], **kwargs),
+            self._create_mamba_block(embed_dims[1], d_state, depths[1], **kwargs)
+        ]))
+        
+        # Third block - three SSMs
+        self.blocks.append(LinearProjection(embed_dims[1], embed_dims[2]))
+        self.blocks.append(nn.ModuleList([
+            self._create_mamba_block(embed_dims[2], d_state, depths[2], **kwargs),
+            self._create_mamba_block(embed_dims[2], d_state, depths[2], **kwargs),
+            self._create_mamba_block(embed_dims[2], d_state, depths[2], **kwargs)
+        ]))
 
 
-        self.interaction_block = self._create_mamba_block(embed_dims[-1], d_state, depths[i], **kwargs)
+        self.interaction_block = self._create_mamba_block(embed_dims[-1], d_state, depths[-1], **kwargs)
 
         # Final norm and classifier
         self.norm = nn.LayerNorm(embed_dims[-1])
@@ -662,61 +717,94 @@ class MSTemba(nn.Module):
         x = x.permute(0, 2, 1)
         x = self.proj(x)
         concat_x = []
+        block_outputs = []  # Store raw block outputs
+        all_c_states = []  # Store C states from all blocks for diversity loss
+        
         for i, block in enumerate(self.blocks):
-            if i == 0 or i == 1:  # First block - no reshaping
-                if isinstance(block, TemporalConvBlock):
+            if i == 0 or i == 1:  # First block
+                if isinstance(block, LinearProjection):
                     x = block(x)
+                    block_c_states = []  # No C states for linear projection
                 else:  # VisionMamba 
                     B, T, C = x.shape
-                    x = block.forward_features(x)
+                    x, C_state = block.forward_features(x)
                     concat_x.append(x)
+                    block_outputs.append(x)  # Store raw output
+                    block_c_states = [C_state] if C_state is not None else []
             
-            # else:  # Second block - reshape to 2B
-            elif i == 2 or i == 3:  # Second block - reshape to 2B
-                if isinstance(block, TemporalConvBlock):
+            elif i == 2 or i == 3:  # Second block - split into odd/even tokens
+                if isinstance(block, LinearProjection):
                     x = block(x)    
-                    # Reshape to (2B, T/2, C)
                     B, T, C = x.shape
-                    x = x.reshape(B, 2, T//2, C).transpose(0, 1).reshape(2*B, T//2, C)
-                else:  # VisionMamba 
-                    x = block.forward_features(x)
-                    # Reshape back from (2B, T/2, C) to (B, T, C)
-                    B2, T_half, C = x.shape
-                    B = B2 // 2
-                    x = x.reshape(2, B, T_half, C).transpose(0, 1).reshape(B, T_half*2, C)
+                    # Split into odd and even tokens
+                    x_even = x[:, ::2, :]  # Even tokens
+                    x_odd = x[:, 1::2, :]  # Odd tokens
+                    block_c_states = []  # No C states for linear projection
+                else:  # VisionMamba with two separate SSMs
+                    # Process even and odd tokens through separate SSMs
+                    x_even_out, C_even = block[0].forward_features(x_even)
+                    x_odd_out, C_odd = block[1].forward_features(x_odd)
+                    
+                    # Interleave the outputs back together
+                    x = torch.zeros(B, T, C, device=x_even_out.device)
+                    x[:, ::2, :] = x_even_out
+                    x[:, 1::2, :] = x_odd_out
+                    
                     concat_x.append(x)
+                    block_outputs.append(x)  # Store raw output
+                    block_c_states = [C_even, C_odd] if C_even is not None and C_odd is not None else []
 
-            elif i == 4 or i == 5:  # Third block - reshape to 3B
-                if isinstance(block, TemporalConvBlock):
+            elif i == 4 or i == 5:  # Third block - split into three groups
+                if isinstance(block, LinearProjection):
                     x = block(x)    
-                    # Reshape to (3B, T/3, C)
                     B, T, C = x.shape
                     # Ensure T is divisible by 3
-                    pad_size = (3 - (T % 3)) % 3  # Calculate padding needed
+                    pad_size = (3 - (T % 3)) % 3
                     if pad_size > 0:
-                        x = F.pad(x, (0, 0, 0, pad_size))  # Pad along temporal dimension
+                        x = F.pad(x, (0, 0, 0, pad_size))
                         T = T + pad_size
-                    x = x.reshape(B, 3, T//3, C).transpose(0, 1).reshape(3*B, T//3, C)
-
-                else:  # VisionMamba 
-                    x = block.forward_features(x)
-                    # Reshape back from (3B, T/3, C) to (B, T, C)
-                    B3, T_third, C = x.shape
-                    B = B3 // 3
-                    x = x.reshape(3, B, T_third, C).transpose(0, 1).reshape(B, T_third*3, C)
+                    
+                    # Split into three groups
+                    x_group1 = x[:, ::3, :]  # First group (0, 3, 6, ...)
+                    x_group2 = x[:, 1::3, :]  # Second group (1, 4, 7, ...)
+                    x_group3 = x[:, 2::3, :]  # Third group (2, 5, 8, ...)
+                    block_c_states = []  # No C states for linear projection
+                else:  # VisionMamba with three separate SSMs
+                    # Process each group through its own SSM
+                    x_out1, C_group1 = block[0].forward_features(x_group1)
+                    x_out2, C_group2 = block[1].forward_features(x_group2)
+                    x_out3, C_group3 = block[2].forward_features(x_group3)
+                    
+                    # Interleave the outputs back together
+                    x = torch.zeros(B, T, C, device=x_out1.device)
+                    x[:, ::3, :] = x_out1
+                    x[:, 1::3, :] = x_out2
+                    x[:, 2::3, :] = x_out3
+                    
                     # Remove padding if it was added
                     if pad_size > 0:
                         x = x[:, :-pad_size, :]
+                    
                     concat_x.append(x)
+                    block_outputs.append(x)  # Store raw output
+                    block_c_states = [C_group1, C_group2, C_group3] if all(c is not None for c in [C_group1, C_group2, C_group3]) else []
+            
+            all_c_states.append(block_c_states)
 
-        return concat_x
+        return concat_x, block_outputs, all_c_states
 
     def forward(self, x):
+        concat_x, block_outputs, all_c_states = self.forward_features(x)
 
-        x = self.forward_features(x)
+        # Process each block output
+        block_predictions = []
+        for i, block_out in enumerate(block_outputs):
+            # Apply block-specific head
+            block_pred = self.block_heads[i](block_out)
+            block_predictions.append(block_pred)
 
         # Fusion and Mamba interaction
-        x1, x2, x3 = x
+        x1, x2, x3 = concat_x
 
         x1 = self.norm(self.scale_proj1(x1))
         x2 = self.norm(self.scale_proj2(x2))
@@ -724,10 +812,24 @@ class MSTemba(nn.Module):
     
         x = x1 + x2 + x3
 
-        x = self.interaction_block(x)
-
+        x, _ = self.interaction_block(x)
+        
         x = self.head(x)
-        return x
+        
+        # Compute C state diversity loss with gradients flowing to Mamba components
+        diversity_loss = torch.tensor(0.0, device=x.device, requires_grad=True)
+        for block_idx, block_c_states in enumerate(all_c_states):
+            if len(block_c_states) >= 2:  # Only compute if we have multiple C states
+                # Filter out None values but keep gradients
+                valid_c_states = [c_state for c_state in block_c_states if c_state is not None]
+                
+                if len(valid_c_states) >= 2:
+                    # Compute diversity loss for all valid C states in this block
+                    # Allow gradients to flow back to Mamba components
+                    block_diversity_loss = compute_c_state_diversity_loss_simple(valid_c_states)
+                    diversity_loss = diversity_loss + block_diversity_loss
+        
+        return x, block_predictions, diversity_loss
 
 
 @register_model
@@ -735,7 +837,6 @@ def mstemba(pretrained=False, **kwargs):
     # Define the model
     model = MSTemba(
         embed_dims=[256, 384, 576],
-        temporal_dims=[256],
         depths=[1, 1, 1],
         d_state=16,
         rms_norm=True,

@@ -224,20 +224,31 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
                               delta_proj_weight, conv1d_out, delta,
                               A, B, C, D, delta_bias, scan_intermediates, out)
         # return rearrange(out_z, "b d l -> b l d")
-        return out_z
+        return out_z, C
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, dout):
+    # def backward(ctx, dout):
+    def backward(ctx, *grad_outputs):
         # dout: (batch, seqlen, dim)
+        if len(grad_outputs) == 1:
+            dout = grad_outputs[0]
+        else:
+            dout, dC_ext = grad_outputs
+
         (xz, conv1d_weight, conv1d_bias, x_dbl, x_proj_weight, delta_proj_weight, 
          conv1d_out, delta, A, B, C, D, delta_bias, scan_intermediates, out) = ctx.saved_tensors
         L = xz.shape[-1]
         delta_rank = delta_proj_weight.shape[1]
         d_state = A.shape[-1] * (1 if not A.is_complex() else 2)
         x, z = xz.chunk(2, dim=1)
+
         if dout.stride(-1) != 1:
             dout = dout.contiguous()
+        # dC_ext can be None; if not None and not contiguous, make contiguous too
+        if len(grad_outputs) > 1 and dC_ext is not None and dC_ext.stride(-1) != 1:
+            dC_ext = dC_ext.contiguous()
+        
         if ctx.checkpoint_lvl == 1:
             conv1d_out = causal_conv1d_cuda.causal_conv1d_fwd(x, conv1d_weight, conv1d_bias,None, True)
             delta = rearrange(delta_proj_weight @ x_dbl[:, :delta_rank].t(),
@@ -252,6 +263,12 @@ class MambaInnerFnNoOutProj(torch.autograd.Function):
             ctx.delta_softplus,
             True  # option to recompute out_z
         )
+
+        if dC_ext is not None:
+            # Ensure shapes align; if your C output is (b, 1, d_state, l), keep the same here.
+            # If your C output is flattened / permuted, invert that here before adding.
+            dC = dC + dC_ext
+
         dD = dD if D is not None else None
         dx_dbl = torch.empty_like(x_dbl)
         dB_proj_bias = None

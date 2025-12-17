@@ -16,7 +16,7 @@ except ImportError:
     causal_conv1d_fn, causal_conv1d_update = None
 
 try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj
+    from mamba_ssm.ops.selective_scan_interface_getC import selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj
 except ImportError:
     selective_scan_fn, mamba_inner_fn, bimamba_inner_fn, mamba_inner_fn_no_out_proj = None, None, None, None, None
 
@@ -36,7 +36,7 @@ class Mamba(nn.Module):
         self,
         d_model,
         d_state=16,
-        d_conv=4,
+        d_conv=4, #4
         expand=2,
         dt_rank="auto",
         dt_min=0.001,
@@ -190,7 +190,6 @@ class Mamba(nn.Module):
         )
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
-
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
         # In the backward pass we write dx and dz next to each other to avoid torch.cat
         if self.use_fast_path and inference_params is None:  # Doesn't support outputting the states
@@ -214,7 +213,7 @@ class Mamba(nn.Module):
                 )    
             elif self.bimamba_type == "v2":
                 A_b = -torch.exp(self.A_b_log.float())
-                out = mamba_inner_fn_no_out_proj(
+                out, C = mamba_inner_fn_no_out_proj(
                     xz,
                     self.conv1d.weight,
                     self.conv1d.bias,
@@ -227,7 +226,7 @@ class Mamba(nn.Module):
                     delta_bias=self.dt_proj.bias.float(),
                     delta_softplus=True,
                 )
-                out_b = mamba_inner_fn_no_out_proj(
+                out_b, C_b = mamba_inner_fn_no_out_proj(
                     xz.flip([-1]),
                     self.conv1d_b.weight,
                     self.conv1d_b.bias,
@@ -245,7 +244,7 @@ class Mamba(nn.Module):
                     out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)
                 else:
                     out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d") / 2, self.out_proj.weight, self.out_proj.bias)
-
+                    C = (C + C_b.flip([-1]))/2
             else:
                 out = mamba_inner_fn(
                     xz,
@@ -283,6 +282,7 @@ class Mamba(nn.Module):
             # We're careful here about the layout, to avoid extra transposes.
             # We want dt to have d as the slowest moving dimension
             # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
+            
             x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
             dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
             dt = self.dt_proj.weight @ dt.t()
@@ -302,6 +302,7 @@ class Mamba(nn.Module):
                 delta_softplus=True,
                 return_last_state=ssm_state is not None,
             )
+
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
@@ -309,7 +310,7 @@ class Mamba(nn.Module):
             out = self.out_proj(y)
         if self.init_layer_scale is not None:
                 out = out * self.gamma    
-        return out
+        return out, C
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype
