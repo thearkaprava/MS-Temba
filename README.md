@@ -36,7 +36,6 @@ Like the previous works (e.g. MS-TCT, PDAN), MS-Temba is built on top of the pre
 
 - Please download the Charades dataset (24 fps version) from this [link](https://prior.allenai.org/projects/charades).
 - Please download the Toyota Smarthome Untrimmed dataset from this [link](https://project.inria.fr/toyotasmarthome/).
-- Please download the MultiTHUMOS dataset from this [link](http://ai.stanford.edu/~syyeung/everymoment.html).
 
 ### I3D features
 Follow this [repository](https://github.com/piergiaj/pytorch-i3d) to extract the snippet-level I3D feature. 
