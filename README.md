@@ -9,7 +9,7 @@
 </div>
 
 <div align="center">
-<img src="assets/ms_temba_teaser.png" />
+<img src="assets/teaser.png" />
 </div>
 
 ## Abstract
